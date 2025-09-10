@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Node (if any frontend code is present)
+node_modules/
+dist/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+*.ipynb_save
+
+# VSCode / IDE
+.vscode/
+.idea/
