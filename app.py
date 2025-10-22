@@ -1,70 +1,108 @@
-
-import os
-import streamlit as st
 import numpy as np
-from agents.llm_agent import LLMAgent
-from utils.nash import two_by_two_mixed_equilibrium, pure_nash_profiles
+import streamlit as st
+from ollama_utils import is_ollama_running, get_llms, chat_with_model
+from game_utils import get_prisoners_dilemma_game, get_tic_tac_toe, get_ultimatum_bargaining_game
+from nash_utils import two_by_two_mixed_equilibrium, pure_nash_profiles
 
-from games.prisoners_dilemma import PD_GAME
-from games.ultimatum import ULTIMATUM_GAME
-from games.auction_first_price import FIRST_PRICE_AUCTION
-from games.tictactoe import TicTacToe
+# ------------------------
+# Streamlit page configuration
+# ------------------------
+def configure_page() -> None:
+    st.set_page_config(
+        page_title="Game Theory GPT Agent",
+        page_icon="🎮",
+        layout="wide"
+    )
 
-st.set_page_config(page_title="Game Theory GPT Agent", page_icon="🎮", layout="wide")
+    st.title("🎮 Game Theory GPT Agent")
+    st.caption("Streamlit + Ollama • Economic games • Nash helpers • Quick visuals")
 
-st.title("🎮 Game Theory GPT Agent")
-st.caption("Streamlit + Ollama (Mistral) • Economic games • Nash helpers • Quick visuals")
+# ------------------------
+# Sidebar: select model
+# ------------------------
+def configure_sidebar() -> tuple[str, bool, bool, bool, str | None, str]:
+    """Returns (game_choice, show_payoff, show_nash, show_chart, selected_model, system_prompt)"""
+    selected_model = None
 
-# Sidebar: game selector and toggles
-game_choice = st.sidebar.selectbox(
-    "Pick a game",
-    ["Prisoner's Dilemma", "Ultimatum Bargaining", "First‑Price Auction", "Tic‑Tac‑Toe"],
-)
+    with st.sidebar:
+        game_choice = st.selectbox(
+            "Pick a game",
+            ["Prisoner's Dilemma", "Tic-Tac-Toe", "First-Price Auction", "Ultimatum Bargaining"],
+            key="sidebar_game_choice"
+        )
 
-show_payoff = st.sidebar.toggle("Show payoff matrix", value=True)
-show_nash   = st.sidebar.toggle("Compute Nash (simple)", value=False)
-show_chart  = st.sidebar.toggle("Show payoff over rounds", value=True)
+        show_payoff = st.checkbox("Show payoff matrix", value=True, key="sidebar_show_payoff")
+        show_nash = st.checkbox("Theoretical Equilibrium", value=False, key="sidebar_show_nash")
+        show_chart = st.checkbox("Show payoff over rounds", value=True, key="sidebar_show_chart")
 
-# Agent setup
-model_name = st.sidebar.text_input("Ollama model", value="mistral")
-system_prompt = st.sidebar.text_area(
-    "Agent system prompt",
-    value=(
-        "You are a helpful game theory assistant. "
-        "Given the current game, state, and history, suggest a good next move and briefly explain the rationale. "
-        "If the opponent is likely to be non‑cooperative, adjust accordingly."
-    ),
-    height=100
-)
-agent = LLMAgent(model=model_name, system_prompt=system_prompt)
+        st.divider()
 
-# Session state for rounds
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts per round
-if "round_num" not in st.session_state:
-    st.session_state.round_num = 0
+        if is_ollama_running():
+            st.success("✅ Ollama is running")
+            models = get_llms()
+            if models:
+                selected_model = st.selectbox("Choose a model", models, key="model_select")
+            else:
+                st.warning("⚠️ No models available. Use `ollama pull <model>` to add one.")
+        else:
+            st.error("❌ Ollama is not running. Please start it first.")
 
-# --- Helper UI ---
-def render_payoff_matrix(matrix, players=("P1","P2"), actions_p1=None, actions_p2=None):
+        system_prompt = st.text_area(
+            "Agent system prompt",
+            value=(
+                "You are a strategic game-theory assistant. "
+                "Analyze the current game, including its state and past moves, and recommend the best next action. "
+                "Briefly explain your reasoning, considering both optimal play and possible non-cooperative behavior from the opponent."
+            ),
+            height=150,
+            key="sidebar_system_prompt"
+        )
+
+    return game_choice, show_payoff, show_nash, show_chart, selected_model, system_prompt
+
+# ------------------------
+# initialize history
+# ------------------------
+def initialize_history() -> None:
+    # Session state for history
+    if "history" not in st.session_state:
+        st.session_state.history = [] 
+    # Session state for rounds
+    if "round_num" not in st.session_state:
+        st.session_state.round_num = 0
+    # TicTacToe board state
+    if "ttt_board" not in st.session_state:
+        st.session_state["ttt_board"] = [" "] * 9
+
+# ------------------------
+# Payoff matrix rendering
+# ------------------------
+def render_payoff_matrix(matrix, players=("P1", "P2"), actions_p1=None, actions_p2=None) -> None:
     st.subheader("Payoff Matrix")
     import pandas as pd
-    # matrix: shape (A, B, 2) -> payoffs (p1,p2)
+    matrix = np.array(matrix)
+    if matrix.ndim != 3 or matrix.shape[2] != 2:
+        st.error("Payoff matrix must have shape (A, B, 2).")
+        return
     A, B, _ = matrix.shape
-    index = [f"{players[0]}:{actions_p1[i] if actions_p1 else i}" for i in range(A)]
-    cols  = [f"{players[1]}:{actions_p2[j] if actions_p2 else j}" for j in range(B)]
+    index = [f"{players[0]}:{(actions_p1[i] if actions_p1 else i)}" for i in range(A)]
+    cols = [f"{players[1]}:{(actions_p2[j] if actions_p2 else j)}" for j in range(B)]
     data = []
     for i in range(A):
         row = []
         for j in range(B):
-            p1,p2 = matrix[i,j]
+            p1, p2 = matrix[i, j]
             row.append(f"({p1}, {p2})")
         data.append(row)
     df = pd.DataFrame(data, index=index, columns=cols)
     st.dataframe(df, use_container_width=True)
 
-def render_round_chart():
+# ------------------------
+# Round chart rendering
+# ------------------------
+def render_round_chart() -> None:
     import matplotlib.pyplot as plt
-    if not st.session_state.history:
+    if not st.session_state.get("history"):
         st.info("Play a round to see the chart.")
         return
     p1s = [r["payoff"][0] for r in st.session_state.history if r.get("payoff") is not None]
@@ -73,154 +111,352 @@ def render_round_chart():
         st.info("No numeric payoffs recorded yet.")
         return
     fig = plt.figure()
-    plt.plot(range(1, len(p1s)+1), p1s, marker="o", label="P1 payoff")
-    plt.plot(range(1, len(p2s)+1), p2s, marker="o", label="P2 payoff")
+    plt.plot(range(1, len(p1s) + 1), p1s, marker="o", label="P1 payoff")
+    plt.plot(range(1, len(p2s) + 1), p2s, marker="o", label="P2 payoff")
     plt.xlabel("Round")
     plt.ylabel("Payoff")
     plt.legend()
     st.pyplot(fig)
 
-def ask_agent(prompt):
-    with st.spinner("Thinking with Mistral…"):
-        reply = agent.chat(prompt)
-    st.markdown(f"**Agent:** {reply}")
-    return reply
+#------------------------
+# Prisoners dilemma
+#------------------------
+def prisoners_dilemma(show_payoff: bool, show_chart: bool) -> tuple[dict, dict, str]:
+    game = get_prisoners_dilemma_game()
 
-# --- Game routing ---
-if game_choice == "Prisoner's Dilemma":
-    st.header("Prisoner's Dilemma")
-    game = PD_GAME
+    st.header(game["name"])
+    st.markdown(game["description"])
 
-    if show_payoff:
-        render_payoff_matrix(game["payoff_matrix"], actions_p1=game["actions"], actions_p2=game["actions"])
+    with st.container(border=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            if show_payoff:
+                render_payoff_matrix(game["payoff_matrix"], actions_p1=game["actions"], actions_p2=game["actions"])
+            
+            col3, col4 = st.columns(2)
+            with col3:
+                action_p1 = st.selectbox("Your move (P1)", game["actions"], key="pd_p1")
+            with col4:
+                default_idx = 1 if len(game["actions"]) > 1 else 0
+                action_p2 = st.selectbox("Opponent move (P2)", game["actions"], index=default_idx, key="pd_p2")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        action_p1 = st.selectbox("Your move (P1)", game["actions"])
-    with col2:
-        action_p2 = st.selectbox("Opponent move (P2)", game["actions"], index=1)
+            if st.button("Play Round", key="pd_play"):
+                i = game["actions"].index(action_p1)
+                j = game["actions"].index(action_p2)
+                payoff = tuple(game["payoff_matrix"][i, j])
+                st.success(f"Payoff this round: P1={payoff[0]}, P2={payoff[1]}")
+                st.session_state.history.append({"game": "PD", "moves": (action_p1, action_p2), "payoff": payoff})
+                st.session_state.round_num += 1
 
-    if st.button("Play Round"):
-        i = game["actions"].index(action_p1)
-        j = game["actions"].index(action_p2)
-        payoff = tuple(game["payoff_matrix"][i,j])
-        st.success(f"Payoff this round: P1={payoff[0]}, P2={payoff[1]}")
-        st.session_state.history.append({"game":"PD","moves":(action_p1, action_p2), "payoff":payoff})
-        st.session_state.round_num += 1
+        with col2:
+            if show_chart:
+                render_round_chart()
+        
+    full_prompt = {
+                "game": "Prisoner's Dilemma",
+                "actions": game["actions"],
+                "payoff_matrix": np.array(game["payoff_matrix"]).tolist(),
+                "history": st.session_state.history[-5:],
+            }
+    
+    placeholder_text="e.g., If the opponent defected last round, should I defect or cooperate now?"
 
-    if show_nash:
-        st.subheader("Nash (basic analysis)")
-        # Try pure strategies
-        pure = pure_nash_profiles(game["payoff_matrix"])
-        st.write("Pure‑strategy equilibria:", pure or "None")
-        # Try 2x2 mixed (C/D only), returns prob of first action for each player
-        p, q = two_by_two_mixed_equilibrium(game["payoff_matrix"])
-        if p is not None:
-            st.write(f"Mixed equilibrium (P1 plays {game['actions'][0]} with p={p:.3f}, "
-                     f"P2 plays {game['actions'][0]} with q={q:.3f})")
-        else:
-            st.write("No interior mixed equilibrium for this payoff table.")
+    return game, full_prompt, placeholder_text
 
-    user_prompt = st.text_area("Chat with the agent about strategy:", height=120,
-                               placeholder="e.g., If the opponent defected last round, should I defect or cooperate now?")
-    if st.button("Ask Agent"):
-        context = {
-            "game": "Prisoner's Dilemma",
-            "actions": game["actions"],
-            "payoff_matrix": game["payoff_matrix"].tolist(),
-            "history": st.session_state.history[-5:],
-        }
-        ask_agent(f"Context: {context}\nUser: {user_prompt}")
+#------------------------
+# Tic-Tac-Toe
+#------------------------
+def tic_tac_toe(show_payoff: bool, show_chart: bool) -> tuple[dict, dict, str]:
+    game = get_tic_tac_toe()
+    st.header(game["name"])
+    st.write(game["description"])
 
-    if show_chart:
-        render_round_chart()
+    # ------------------------
+    # Initialize state
+    # ------------------------
+    if "ttt_board" not in st.session_state:
+        st.session_state["ttt_board"] = [" "] * 9
+    if "ttt_turn" not in st.session_state:
+        st.session_state["ttt_turn"] = "X"
+    if "ttt_winner" not in st.session_state:
+        st.session_state["ttt_winner"] = None
 
-elif game_choice == "Ultimatum Bargaining":
-    st.header("Ultimatum Bargaining")
-    game = ULTIMATUM_GAME
+    board = st.session_state["ttt_board"]
+    turn = st.session_state["ttt_turn"]
+    winner = st.session_state["ttt_winner"]
 
-    total = st.number_input("Total pie", min_value=1, value=10, step=1)
-    offer = st.slider("P1 offer to P2", min_value=0, max_value=total, value=5)
+    # ------------------------
+    # Helper: check winner
+    # ------------------------
+    def check_winner(b):
+        win_combinations = [
+            [0, 1, 2], [3, 4, 5], [6, 7, 8],
+            [0, 3, 6], [1, 4, 7], [2, 5, 8],
+            [0, 4, 8], [2, 4, 6]
+        ]
+        for combo in win_combinations:
+            if b[combo[0]] == b[combo[1]] == b[combo[2]] != " ":
+                return b[combo[0]]
+        return None
 
-    if st.button("Propose Offer"):
-        accept_threshold = st.slider("P2 minimum acceptable offer (simulate)", 0, total, 4, key="ult_thresh")
-        accepted = offer >= accept_threshold
-        payoff = (total-offer, offer) if accepted else (0,0)
-        st.info(f"P2 {'accepted ✅' if accepted else 'rejected ❌'}; Payoff P1={payoff[0]}, P2={payoff[1]}")
-        st.session_state.history.append({"game":"Ultimatum","offer":offer,"accepted":accepted,"payoff":payoff})
-        st.session_state.round_num += 1
+    # ------------------------
+    # Show current turn or winner
+    # ------------------------
+    if winner:
+        st.markdown(f"### :red[Player {winner} Wins! 🎉]")
+    else:
+        st.subheader(f"Current Turn: {turn}")
 
-    if show_payoff:
-        st.write("Payoffs depend on accept/reject; toggle the slider to explore outcomes.")
-
-    if show_nash:
-        st.write("In the subgame‑perfect equilibrium (with perfectly rational P2), any positive offer is accepted; P1 offers the smallest positive unit. Real players deviate due to fairness norms.")
-
-    user_prompt = st.text_area("Ask the agent about bargaining strategy:", height=120)
-    if st.button("Ask Agent", key="ult_chat"):
-        context = {"game":"Ultimatum", "history": st.session_state.history[-5:], "total": total, "offer": offer}
-        ask_agent(f"Context: {context}\nUser: {user_prompt}")
-
-    if show_chart:
-        render_round_chart()
-
-elif game_choice == "First‑Price Auction":
-    st.header("First‑Price Sealed‑Bid Auction")
-    game = FIRST_PRICE_AUCTION
-
-    private_value = st.number_input("Your private value v", min_value=0.0, value=10.0, step=0.5)
-    bids = st.text_input("Enter rival bids (comma‑sep)", value="6.5, 8.0, 9.2")
-    try:
-        rival_bids = [float(x.strip()) for x in bids.split(",") if x.strip()]
-    except Exception:
-        rival_bids = []
-
-    if st.button("Submit Bid"):
-        your_bid = st.slider("Your bid (simulate)", min_value=0.0, max_value=float(private_value), value=max(0.0, private_value*0.7))
-        all_bids = rival_bids + [your_bid]
-        max_bid = max(all_bids) if all_bids else 0.0
-        winners = [i for i,b in enumerate(all_bids) if b == max_bid]
-        you_win = (len(all_bids)-1) in winners and len(winners)==1
-        payoff = (private_value - your_bid) if you_win else 0.0
-        st.info(f"You {'win' if you_win else 'lose'}; payoff = {payoff:.2f}")
-        st.session_state.history.append({"game":"Auction","your_bid":your_bid,"rivals":rival_bids,"win":you_win,"payoff":(payoff,0)})
-        st.session_state.round_num += 1
-
-    if show_payoff:
-        st.write("Risk‑neutral symmetric equilibrium (Uniform[0,1] values) is b(v)= (n-1)/n * v. Use agent chat to adapt.")
-
-    if show_nash:
-        st.write("Closed‑form bidding functions exist under specific assumptions; for general inputs we rely on heuristics or learning.")
-
-    user_prompt = st.text_area("Ask the agent about auction strategy:", height=120)
-    if st.button("Ask Agent", key="auc_chat"):
-        n = len(rival_bids) + 1
-        context = {"game":"First‑Price Auction","n_bidders":n,"history":st.session_state.history[-5:],"v":private_value,"rival_bids":rival_bids}
-        ask_agent(f"Context: {context}\nUser: {user_prompt}")
-
-    if show_chart:
-        render_round_chart()
-
-else:  # Tic‑Tac‑Toe
-    st.header("Tic‑Tac‑Toe")
-    ttt = TicTacToe()
-    st.write("Click to make a move; agent suggests a move given the board.")
-    board = st.session_state.get("ttt_board") or [" "]*9
-
+    # ------------------------
+    # Render 3x3 grid
+    # ------------------------
     cols = st.columns(3)
     for i in range(9):
-        if cols[i//3].button(board[i] if board[i] != " " else "□", key=f"cell_{i}"):
-            if board[i] == " ":
-                board[i] = "X"
-                st.session_state["ttt_board"] = board
+        with cols[i % 3]:
+            disabled = board[i] != " " or winner is not None
+            if st.button(board[i] if board[i] != " " else "□", key=f"cell_{i}", disabled=disabled):
+                if board[i] == " " and winner is None:
+                    board[i] = turn
+                    st.session_state["ttt_turn"] = "O" if turn == "X" else "X"
+                    st.session_state["ttt_board"] = board
+                    win = check_winner(board)
+                    if win:
+                        st.session_state["ttt_winner"] = win
+                    st.rerun()
 
-    st.write("Board:", "".join(board))
-    if st.button("Agent Suggests Move"):
-        context = {"game":"TicTacToe","board":board}
-        suggestion = ask_agent(f"Given a Tic‑Tac‑Toe board as list of 9 cells (row‑major), empty=' ', X is user, O is opponent. "
-                               f"Return the best empty cell index (0-8) and a short reason. Board={board}")
-        st.write("Use the suggested index to play O.")
-
+    # ------------------------
+    # Reset
+    # ------------------------
     if st.button("Reset Board"):
-        st.session_state["ttt_board"] = [" "]*9
-        st.experimental_rerun()
+        st.session_state["ttt_board"] = [" "] * 9
+        st.session_state["ttt_turn"] = "X"
+        st.session_state["ttt_winner"] = None
+        st.rerun()
+
+    # ------------------------
+    # Prepare prompt for chatbot
+    # ------------------------
+    full_prompt = {
+        "game": "Tic-Tac-Toe",
+        "board": board,
+        "current_turn": turn,
+        "winner": winner,
+        "prompt": (
+            f"The current Tic-Tac-Toe board is {board}. "
+            f"It is player {turn}'s turn. "
+            f"Suggest the optimal next move(s) or strategy. "
+            f"Use 0–8 indexing for board positions (left-to-right, top-to-bottom). "
+            f"Explain why the suggested move is best. "
+            f"If the game is over, simply summarize the outcome."
+        )
+    }
+
+    placeholder_text = (
+        "Ask about your next best move — e.g., 'What’s the optimal next move for X?'"
+    )
+
+    # ------------------------
+    # Display current board
+    # ------------------------
+    st.write("Board:", "".join(board))
+
+    return game, full_prompt, placeholder_text
+
+
+
+
+# ------------------------
+# First-Price Auction Game
+# ------------------------
+def first_price_auction_game():
+    ...
+
+# ------------------------
+# Ultimatum Bargaining Game
+# ------------------------
+def ultimatum_bargaining_game(show_payoff: bool, show_chart: bool) -> tuple[dict, dict, str]:
+    game = get_ultimatum_bargaining_game()
+
+    st.header(game["name"])
+    st.write(game["description"])
+
+    total = 100
+    col1, col2 = st.columns(2)
+    with col1:
+        offer = st.slider("Player 1 Offer (0–100)", 0, total, 50, step=5, key="ug_offer")
+    with col2:
+        response = st.selectbox("Player 2 Decision", ["Accept", "Reject"], key="ug_response")
+
+    # ------------------------
+    # Compute payoffs
+    # ------------------------
+    if st.button("Play Round", key="ug_play"):
+        if response == "Accept":
+            payoff = (total - offer, offer)
+            st.success(f"✅ Offer accepted! P1 gets {payoff[0]}, P2 gets {payoff[1]}")
+        else:
+            payoff = (0, 0)
+            st.error("❌ Offer rejected! Both players get 0.")
+
+        st.session_state.history.append({
+            "game": "Ultimatum",
+            "offer": offer,
+            "response": response,
+            "payoff": payoff
+        })
+        st.session_state.round_num += 1
+
+    # ------------------------
+    # Optional payoff table and chart side by side
+    # ------------------------
+    if show_payoff or show_chart:
+        st.subheader("Visual Insights")
+
+        col_table, col_chart = st.columns([1, 1.2])
+
+        with col_table:
+            if show_payoff:
+                import pandas as pd
+                st.markdown("**Payoffs if Accepted**")
+                data = [{"Offer": o, "P1 Payoff": total - o, "P2 Payoff": o} for o in range(0, total + 1, 20)]
+                df = pd.DataFrame(data)
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        with col_chart:
+            if show_chart:
+                st.markdown("**Offer History Chart**")
+                render_round_chart()
+
+    # ------------------------
+    # Prompt for AI agent
+    # ------------------------
+    full_prompt = {
+        "game": "Ultimatum Bargaining Game",
+        "total": total,
+        "last_offer": offer,
+        "last_response": response,
+        "history": st.session_state.history[-5:],
+        "prompt": (
+            f"In an Ultimatum Bargaining Game with 100 units, Player 1 offered {offer} units to Player 2. "
+            f"Player 2 chose to '{response}'. "
+            f"Discuss whether this was rational from both sides' perspectives. "
+            f"Suggest an optimal offer strategy for Player 1 and an acceptance threshold for Player 2."
+        ),
+    }
+
+    placeholder_text = (
+        "Ask the agent: 'What’s a fair offer that’s likely to be accepted?' or "
+        "'Why might rejecting low offers be irrational?'"
+    )
+
+    return game, full_prompt, placeholder_text
+
+
+
+# ------------------------
+# Theoretical Nash Equilibrium Display
+# ------------------------   
+# ------------------------
+# Theoretical Nash Equilibrium Display
+# ------------------------
+def theoretical_nash_equilibrium(game: dict, show_nash: bool) -> None:
+    if show_nash:
+        with st.container(border=True):
+            st.subheader("Theoretical Nash Equilibrium")
+            st.markdown(game["nash_equilibrium"])
+
+            # Show pure strategy equilibria for all games except Ultimatum Bargaining
+            if game.get("name") != "Ultimatum Bargaining Game":
+                pure = pure_nash_profiles(np.array(game["payoff_matrix"]))
+                st.write("Pure-strategy equilibria:", pure or "None")
+
+            # Always show mixed equilibrium (if 2x2)
+            try:
+                p, q = two_by_two_mixed_equilibrium(np.array(game["payoff_matrix"]))
+                if p is not None:
+                    st.write(
+                        f"Mixed equilibrium (P1 plays {game['actions'][0]} with p={p:.3f}, "
+                        f"P2 plays {game['actions'][0]} with q={q:.3f})"
+                    )
+                else:
+                    st.write("No interior mixed equilibrium for this payoff table.")
+            except Exception:
+                st.write("Mixed equilibrium not applicable for this game.")
+
+    
+# ------------------------
+# GPT Agent Interaction
+# ------------------------
+def query_gpt_agent(model: str , prompt: str) -> None:
+    with st.spinner("Thinking..."):
+        with st.expander("Response", expanded=True):
+            response_placeholder = st.empty()
+            full_response = ""
+            for chunk in chat_with_model(model, prompt):
+                if any(tag in chunk for tag in ["<think>", "</think>"]):
+                    continue
+                full_response += chunk
+                response_placeholder.markdown(f"{full_response}")
+
+# ------------------------
+# Agent Chat Interface
+# ------------------------
+def render_ai_agent_ui(model: str, full_prompt: str, placeholder_text: str, system_prompt: str) -> None:
+    with st.container(border=True):
+        user_prompt = st.text_area("Chat with the agent about strategy:", height=120,
+                                placeholder=placeholder_text,
+                                key="pd_user_prompt")
+        
+        if st.button("Ask Agent", key="pd_ask_agent"):
+            query_gpt_agent(model, f"Context: {full_prompt} \n System: {system_prompt} \n User: {user_prompt}")
+
+# ------------------------
+# Main app logic
+# ------------------------
+def main():
+    configure_page()
+
+    game_choice, show_payoff, show_nash, show_chart, selected_model, system_prompt = configure_sidebar()
+
+    if not selected_model:
+        st.info("Select a model from the sidebar to begin.")
+        return
+
+    initialize_history()
+
+    # ------------------------
+    # Route to chosen game
+    # ------------------------
+    if game_choice == "Prisoner's Dilemma":
+        game, full_prompt, placeholder_text = prisoners_dilemma(show_payoff, show_chart)
+    elif game_choice == "Tic-Tac-Toe":
+        game, full_prompt, placeholder_text = tic_tac_toe(show_payoff, show_chart)
+    elif game_choice == "Ultimatum Bargaining":
+        game, full_prompt, placeholder_text = ultimatum_bargaining_game(show_payoff, show_chart)
+    else:
+        st.warning("Selected game not implemented yet.")
+        return
+
+    # ------------------------
+    # Theoretical Nash Equilibrium (safe rendering)
+    # ------------------------
+    try:
+        if show_nash:
+            theoretical_nash_equilibrium(game, show_nash)
+    except Exception as e:
+        st.warning(f"⚠️ Unable to compute Nash Equilibrium: {e}")
+
+    # ------------------------
+    # Always render the AI agent last in its own container
+    # ------------------------
+    with st.container():
+        st.divider()
+        render_ai_agent_ui(selected_model, full_prompt, placeholder_text, system_prompt)
+
+
+if __name__ == "__main__":
+    main()
